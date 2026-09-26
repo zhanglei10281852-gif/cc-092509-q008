@@ -125,6 +125,7 @@ class DossierLifecycleService:
                     "source_dossier_id": dossier_id,
                     "root_dossier_id": parent["root_dossier_id"],
                     "asset_type": parent["asset_type"],
+                    "secrecy_level": parent["secrecy_level"],
                     "quantity": item["quantity"],
                     "unit": parent["unit"],
                     "lifecycle_state": "available",

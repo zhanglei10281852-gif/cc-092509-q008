@@ -26,6 +26,7 @@ class DossierCreate(BaseModel):
     intake_id: int = Field(gt=0)
     disclosure_event_id: int | None = Field(default=None, gt=0)
     asset_type: str = Field(min_length=1, max_length=100)
+    secrecy_level: Literal["internal", "confidential", "restricted", "top_secret"] = "internal"
     quantity: float = Field(gt=0)
     unit: str = Field(min_length=1, max_length=20)
     vault_id: int | None = Field(default=None, gt=0)

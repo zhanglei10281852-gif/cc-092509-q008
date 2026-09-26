@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS dossiers (
     source_dossier_id INTEGER REFERENCES dossiers(id),
     root_dossier_id INTEGER REFERENCES dossiers(id),
     asset_type TEXT NOT NULL,
+    secrecy_level TEXT NOT NULL DEFAULT 'internal' CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret')),
     quantity REAL NOT NULL CHECK(quantity >= 0),
     reserved_quantity REAL NOT NULL DEFAULT 0 CHECK(reserved_quantity >= 0),
     unit TEXT NOT NULL,
@@ -335,6 +336,70 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS access_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_code TEXT NOT NULL UNIQUE,
+    consultant_name TEXT NOT NULL,
+    consultant_organization TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    needed_until TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','partially_approved','rejected','cancelled')),
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    idempotency_key TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS access_request_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES access_requests(id) ON DELETE CASCADE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    purpose TEXT NOT NULL,
+    actions_json TEXT NOT NULL,
+    requires_approval INTEGER NOT NULL CHECK(requires_approval IN (0,1)),
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected')),
+    decided_by INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    decision_comment TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(request_id, dossier_id)
+);
+CREATE INDEX IF NOT EXISTS idx_access_items_request ON access_request_items(request_id);
+
+CREATE TABLE IF NOT EXISTS access_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_code TEXT NOT NULL UNIQUE,
+    request_id INTEGER NOT NULL REFERENCES access_requests(id),
+    consultant_name TEXT NOT NULL,
+    issued_by INTEGER NOT NULL REFERENCES users(id),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    renewed_count INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL CHECK(state IN ('active','expired','revoked')),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_sessions_request ON access_sessions(request_id);
+
+CREATE TABLE IF NOT EXISTS access_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES access_sessions(id),
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    action TEXT NOT NULL CHECK(action IN ('view','download')),
+    actor_user_id INTEGER NOT NULL REFERENCES users(id),
+    idempotency_key TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_access_records_session ON access_records(session_id);
 """
 
 PERMISSIONS = [
@@ -349,6 +414,8 @@ PERMISSIONS = [
     ("dossiers.disclose", "登记披露使用", "dossiers", "disclose"),
     ("dossiers.dispose", "执行合规处置", "dossiers", "dispose"),
     ("access_loans.manage", "管理查阅借阅", "access_loans", "manage"),
+    ("access_requests.manage", "管理外部查阅申请与会话", "access_requests", "manage"),
+    ("access_requests.decide", "审批外部查阅申请", "access_requests", "decide"),
     ("inventory_review.manage", "管理载体盘点", "inventory_review", "manage"),
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
@@ -401,10 +468,21 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """为早期版本创建的数据库补充后续新增的列。"""
+    dossier_columns = {row[1] for row in connection.execute("PRAGMA table_info(dossiers)")}
+    if "secrecy_level" not in dossier_columns:
+        connection.execute(
+            "ALTER TABLE dossiers ADD COLUMN secrecy_level TEXT NOT NULL DEFAULT 'internal' "
+            "CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret'))"
+        )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _ensure_columns(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -432,9 +510,10 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "access_requests.manage",
             ],
             "researcher": ["dossiers.read", "dossiers.disclose"],
-            "approver": ["dossiers.read", "approvals.decide"],
+            "approver": ["dossiers.read", "approvals.decide", "access_requests.decide"],
             "auditor": ["dossiers.read", "audit.read"],
         }
         for role_code, permission_codes in role_permissions.items():

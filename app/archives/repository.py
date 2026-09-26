@@ -107,11 +107,12 @@ class DossierRepository:
     def create(self, data: dict[str, Any], now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
             """INSERT INTO dossiers(dossier_code,intake_id,disclosure_event_id,source_dossier_id,root_dossier_id,asset_type,
-               quantity,unit,lifecycle_state,vault_id,custody_user_id,provenance_depth,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               secrecy_level,quantity,unit,lifecycle_state,vault_id,custody_user_id,provenance_depth,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["dossier_code"], data["intake_id"], data.get("disclosure_event_id"), data.get("source_dossier_id"),
-                data.get("root_dossier_id"), data["asset_type"], data["quantity"], data["unit"], data["lifecycle_state"],
+                data.get("root_dossier_id"), data["asset_type"], data.get("secrecy_level", "internal"), data["quantity"],
+                data["unit"], data["lifecycle_state"],
                 data.get("vault_id"), data.get("custody_user_id"), data.get("provenance_depth", 0), now, now,
             ),
         )
