@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS dossiers (
     source_dossier_id INTEGER REFERENCES dossiers(id),
     root_dossier_id INTEGER REFERENCES dossiers(id),
     asset_type TEXT NOT NULL,
+    secrecy_level TEXT NOT NULL DEFAULT 'internal' CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret')),
     quantity REAL NOT NULL CHECK(quantity >= 0),
     reserved_quantity REAL NOT NULL DEFAULT 0 CHECK(reserved_quantity >= 0),
     unit TEXT NOT NULL,
@@ -335,6 +336,112 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS review_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_code TEXT NOT NULL UNIQUE,
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    visitor_name TEXT NOT NULL,
+    visitor_organization TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','partially_approved','rejected','cancelled','expired')),
+    expires_at TEXT NOT NULL,
+    access_starts_at TEXT NOT NULL,
+    access_expires_at TEXT NOT NULL,
+    decided_at TEXT,
+    finalized_by INTEGER REFERENCES users(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_review_requests_state ON review_requests(state);
+
+CREATE TABLE IF NOT EXISTS review_request_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES review_requests(id) ON DELETE CASCADE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    purpose TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('view','download')),
+    download_limit INTEGER NOT NULL DEFAULT 0 CHECK(download_limit >= 0),
+    secrecy_level TEXT NOT NULL,
+    required_approvals INTEGER NOT NULL DEFAULT 0 CHECK(required_approvals >= 0),
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','cancelled')),
+    reject_reason TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(request_id, dossier_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_items_request ON review_request_items(request_id);
+
+CREATE TABLE IF NOT EXISTS review_item_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES review_request_items(id) ON DELETE CASCADE,
+    approver_user_id INTEGER NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    comment TEXT NOT NULL DEFAULT '',
+    decided_at TEXT NOT NULL,
+    UNIQUE(item_id, approver_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS review_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_code TEXT NOT NULL UNIQUE,
+    request_id INTEGER NOT NULL REFERENCES review_requests(id),
+    visitor_name TEXT NOT NULL,
+    visitor_organization TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active','revoked','expired','closed')),
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by INTEGER REFERENCES users(id),
+    revoked_at TEXT,
+    renew_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_sessions_request ON review_sessions(request_id);
+CREATE INDEX IF NOT EXISTS idx_review_sessions_state ON review_sessions(state);
+
+CREATE TABLE IF NOT EXISTS review_session_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES review_sessions(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES review_request_items(id),
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    purpose TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('view','download')),
+    download_limit INTEGER NOT NULL CHECK(download_limit >= 0),
+    download_count INTEGER NOT NULL DEFAULT 0 CHECK(download_count >= 0),
+    state TEXT NOT NULL CHECK(state IN ('active','revoked','expired')),
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by INTEGER REFERENCES users(id),
+    revoked_at TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(session_id, dossier_id),
+    CHECK(download_count <= download_limit)
+);
+CREATE INDEX IF NOT EXISTS idx_grants_session ON review_session_grants(session_id);
+CREATE INDEX IF NOT EXISTS idx_grants_dossier ON review_session_grants(dossier_id);
+
+CREATE TABLE IF NOT EXISTS review_access_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES review_sessions(id),
+    grant_id INTEGER NOT NULL REFERENCES review_session_grants(id),
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    operator_user_id INTEGER NOT NULL REFERENCES users(id),
+    action TEXT NOT NULL CHECK(action IN ('view','download')),
+    file_ref TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_records_session ON review_access_records(session_id);
+CREATE INDEX IF NOT EXISTS idx_access_records_grant ON review_access_records(grant_id);
 """
 
 PERMISSIONS = [
@@ -353,6 +460,10 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("review.requests", "登记外部顾问查阅申请", "review_requests", "manage"),
+    ("review.decide", "审批顾问查阅申请", "review_requests", "decide"),
+    ("review.sessions", "管理顾问查阅会话与下载", "review_sessions", "manage"),
+    ("review.stats", "查看查阅申请与访问统计", "review_stats", "read"),
 ]
 
 
@@ -401,10 +512,20 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _apply_column_migrations(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(dossiers)").fetchall()}
+    if "secrecy_level" not in columns:
+        connection.execute(
+            "ALTER TABLE dossiers ADD COLUMN secrecy_level TEXT NOT NULL DEFAULT 'internal' "
+            "CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret'))"
+        )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _apply_column_migrations(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -432,10 +553,11 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "review.requests", "review.sessions", "review.decide", "review.stats",
             ],
-            "researcher": ["dossiers.read", "dossiers.disclose"],
-            "approver": ["dossiers.read", "approvals.decide"],
-            "auditor": ["dossiers.read", "audit.read"],
+            "researcher": ["dossiers.read", "dossiers.disclose", "review.requests"],
+            "approver": ["dossiers.read", "approvals.decide", "review.decide", "review.stats"],
+            "auditor": ["dossiers.read", "audit.read", "review.stats"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
